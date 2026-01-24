@@ -9,8 +9,10 @@ from PIL import Image
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 from collections import defaultdict
+from openpyxl import load_workbook
+from openpyxl.styles import PatternFill, Font
 
-# ================== ONEDRIVE PATH ==================
+# ================== PATHS ==================
 ONEDRIVE = os.environ.get("OneDrive")
 if not ONEDRIVE:
     raise RuntimeError("❌ OneDrive not found")
@@ -29,36 +31,75 @@ HEADERS = [
     "Clear Amount", "Comment"
 ]
 
-# ================== EXCEL HANDLING ==================
+# ================== SAFE EXCEL ==================
+def wait_for_excel():
+    while True:
+        try:
+            with open(EXCEL, "a"):
+                return
+        except PermissionError:
+            print("⏳ Excel open, waiting...")
+            time.sleep(2)
+
 def load_excel():
     if not os.path.exists(EXCEL):
         df = pd.DataFrame(columns=HEADERS)
-        safe_save(df)
+        df.to_excel(EXCEL, index=False)
+        apply_formulas_and_formatting()
         return df
 
-    try:
-        df = pd.read_excel(EXCEL)
-    except:
-        df = pd.DataFrame(columns=HEADERS)
-
-    if list(df.columns) != HEADERS:
-        df = pd.DataFrame(columns=HEADERS)
-        safe_save(df)
-
+    wait_for_excel()
+    df = pd.read_excel(EXCEL)
+    df = df.reindex(columns=HEADERS)
     return df
 
-def safe_save(df):
-    # retry if excel is open
-    for _ in range(10):
-        try:
-            df.to_excel(EXCEL, index=False)
-            return
-        except PermissionError:
-            time.sleep(1)
+def save_excel(df):
+    wait_for_excel()
+    df.to_excel(EXCEL, index=False)
+    apply_formulas_and_formatting()
 
-def next_sr(df):
-    df2 = df[df["Particular"].str.upper() != "TOTAL"]
-    return len(df2) + 1
+# ================== FORMATTING + FORMULAS ==================
+def apply_formulas_and_formatting():
+    wb = load_workbook(EXCEL)
+    ws = wb.active
+
+    YELLOW = PatternFill("solid", fgColor="FFFFF200")
+    BOLD = Font(bold=True)
+
+    # Header
+    for cell in ws[1]:
+        cell.fill = YELLOW
+        cell.font = BOLD
+
+    # Remove old TOTAL
+    for r in range(ws.max_row, 1, -1):
+        if ws.cell(r, 5).value == "TOTAL":
+            ws.delete_rows(r)
+
+    last_row = ws.max_row
+    total_row = last_row + 1
+
+    # TOTAL formulas
+    ws.cell(total_row, 5).value = "TOTAL"
+    ws.cell(total_row, 6).value = f"=SUM(F2:F{last_row})"
+    ws.cell(total_row, 7).value = f"=SUM(G2:G{last_row})"
+
+    for col in range(1, 10):
+        ws.cell(total_row, col).fill = YELLOW
+        ws.cell(total_row, col).font = BOLD
+
+    # AUTO COLUMN WIDTH
+    for col in ws.columns:
+        max_length = 0
+        col_letter = col[0].column_letter
+        for cell in col:
+            try:
+                max_length = max(max_length, len(str(cell.value)))
+            except:
+                pass
+        ws.column_dimensions[col_letter].width = max_length + 3
+
+    wb.save(EXCEL)
 
 # ================== OCR ==================
 def ocr_file(path):
@@ -66,20 +107,17 @@ def ocr_file(path):
     if path.lower().endswith(".pdf"):
         with pdfplumber.open(path) as pdf:
             for p in pdf.pages:
-                t = p.extract_text()
-                if t:
-                    text += t + " "
+                if p.extract_text():
+                    text += p.extract_text() + " "
     else:
         text = pytesseract.image_to_string(Image.open(path))
-
     return re.sub(r"\s+", " ", text)
 
 # ================== PARTICULAR ==================
 def extract_particular(text):
     case_types = [
-        r"Writ Petition\s*\(C\)", r"CS\s*\(COMM\)",
-        r"LPA", r"IPD", r"FAO", r"RFA",
-        r"CM", r"ARB\.?P", r"OMP"
+        r"Writ Petition\s*\(C\)", r"CS\s*\(COMM\)", r"LPA",
+        r"IPD", r"FAO", r"RFA", r"CM", r"ARB\.?P", r"OMP"
     ]
 
     pattern = re.compile(
@@ -96,7 +134,7 @@ def extract_particular(text):
     for case, num, year, court in matches:
         grouped[(case.upper(), year, court.strip())].append(int(num))
 
-    result = []
+    results = []
     for (case, year, court), nums in grouped.items():
         nums = sorted(set(nums))
         ranges = []
@@ -108,95 +146,67 @@ def extract_particular(text):
             else:
                 ranges.append(f"{s}-{p}" if s != p else str(s))
                 s = p = n
-
         ranges.append(f"{s}-{p}" if s != p else str(s))
 
-        result.append(
+        results.append(
             f"{case.title()} No. {', '.join(ranges)} of {year} before the {court}"
         )
 
-    return "; ".join(result)
+    return "; ".join(results)
 
 # ================== AMOUNT ==================
 def extract_amount(text):
-    patterns = [
+    for p in [
         r"Total\s*Invoice\s*Value.*?([0-9,]+\.\d{2})",
         r"Grand\s*Total.*?([0-9,]+\.\d{2})",
         r"Total\s*Amount.*?([0-9,]+\.\d{2})"
-    ]
-
-    for p in patterns:
+    ]:
         m = re.search(p, text, re.I)
         if m:
             return float(m.group(1).replace(",", ""))
-
     return 0.0
-
-# ================== FIELD EXTRACTION ==================
-def extract_fields(text, sr):
-    date = ""
-    inv = ""
-    ref = ""
-
-    d = re.search(r"\d{1,2}-[A-Za-z]{3}-\d{4}", text)
-    if d:
-        date = d.group()
-
-    i = re.findall(r"\b[A-Z0-9]{6,}\b", text)
-    if i:
-        inv = max(i, key=len)
-
-    r = re.search(r"(Our\s*Ref|Ref)\s*[:\-]?\s*([A-Z0-9\/\-]+)", text, re.I)
-    if r:
-        ref = r.group(2)
-
-    amt = extract_amount(text)
-    tds = round(amt * 0.10, 2)
-
-    return [
-        sr, date, inv, ref,
-        extract_particular(text),
-        amt, tds, "", ""
-    ]
-
-# ================== TOTAL ROW ==================
-def add_total(df):
-    df = df[df["Particular"].str.upper() != "TOTAL"]
-
-    total_amt = df["Amount"].astype(float).sum()
-    total_tds = df["TDS (10%)"].astype(float).sum()
-
-    total_row = {
-        "Sr.No": "",
-        "Invoice Date": "",
-        "Invoice No": "",
-        "Ref No": "",
-        "Particular": "TOTAL",
-        "Amount": round(total_amt, 2),
-        "TDS (10%)": round(total_tds, 2),
-        "Clear Amount": "",
-        "Comment": ""
-    }
-
-    return pd.concat([df, pd.DataFrame([total_row])], ignore_index=True)
 
 # ================== PROCESS FILE ==================
 def process_file(path):
     time.sleep(2)
+    text = ocr_file(path)
 
+    invs = re.findall(r"\b[A-Z0-9]{6,}\b", text)
+    if not invs:
+        print("⚠ Invoice No not found")
+        return
+
+    inv = max(invs, key=len)
     df = load_excel()
-    sr = next_sr(df)
 
-    row = extract_fields(ocr_file(path), sr)
-    df.loc[len(df)] = row
+    if inv in df["Invoice No"].astype(str).values:
+        print("⚠ Duplicate skipped:", inv)
+        shutil.move(path, os.path.join(PROCESSED, os.path.basename(path)))
+        return
 
-    df = add_total(df)
-    safe_save(df)
+    date = re.search(r"\d{1,2}-[A-Za-z]{3}-\d{4}", text)
+    ref = re.search(r"(Our\s*Ref|Ref)\s*[:\-]?\s*([A-Z0-9\/\-]+)", text, re.I)
 
+    amt = extract_amount(text)
+    df = df[df["Particular"] != "TOTAL"]
+
+    df.loc[len(df)] = [
+        len(df) + 1,
+        date.group() if date else "",
+        inv,
+        ref.group(2) if ref else "",
+        extract_particular(text),
+        amt,
+        round(amt * 0.10, 2),
+        round(amt * 0.90, 2),
+        ""
+    ]
+
+    save_excel(df)
     shutil.move(path, os.path.join(PROCESSED, os.path.basename(path)))
     print("✔ Processed:", os.path.basename(path))
 
-# ================== WATCHER ==================
+# ================== WATCHDOG ==================
 class Handler(FileSystemEventHandler):
     def on_created(self, e):
         if not e.is_directory:
@@ -204,24 +214,24 @@ class Handler(FileSystemEventHandler):
 
 # ================== MAIN ==================
 if __name__ == "__main__":
-    print("🚀 Invoice Automation Started")
+    print("🚀 Invoice Automation Running")
 
-    # Process existing files on startup
     for f in os.listdir(INPUT):
-        path = os.path.join(INPUT, f)
-        if os.path.isfile(path):
-            process_file(path)
+        p = os.path.join(INPUT, f)
+        if os.path.isfile(p):
+            process_file(p)
 
-    observer = Observer()
-    observer.schedule(Handler(), INPUT, recursive=False)
-    observer.start()
+    obs = Observer()
+    obs.schedule(Handler(), INPUT, recursive=False)
+    obs.start()
 
     try:
         while True:
             time.sleep(5)
     except KeyboardInterrupt:
-        observer.stop()
+        obs.stop()
 
-    observer.join()
+    obs.join()
+
 
 
